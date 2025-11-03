@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Node BLE Configuration</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; max-width:800px; margin:20px auto; padding:20px; background:#f5f7fb; color:#111; }
+  h1 { font-size:20px; margin-bottom:10px; }
+  label { display:block; margin-top:10px; font-weight:600; }
+  input, select, button { padding:10px; font-size:14px; margin-top:6px; border-radius:6px; border:1px solid #cbd5e1; width:100%; box-sizing:border-box; }
+  .row { display:flex; gap:10px; }
+  .col { flex:1; }
+  #status { margin-top:12px; padding:12px; background:white; border-radius:8px; min-height:90px; white-space:pre-line; overflow:auto; border:1px solid #e2e8f0; font-family: monospace; font-size: 13px; }
+  #progressBar { width:100%; background:#e2e8f0; border-radius:6px; height:14px; margin-top:8px; overflow:hidden; }
+  #progressFill { height:100%; width:0%; background:#10b981; transition: width 0.15s ease; }
+  .small { font-size:13px; color:#475569; margin-top:6px; }
+  button.primary { background:#0ea5a4; color:white; border:none; cursor:pointer; }
+  button.secondary { background:#64748b; color:#fff; border:none; cursor:pointer; }
+  button:disabled { background:#94a3b8; cursor:not-allowed; }
+  .error { color: #dc2626; }
+  .success { color: #059669; }
+  .warning { color: #d97706; }
+</style>
+</head>
+<body>
+  <h1> SACAQM Air Quality Monitoring Node BLE Configuration</h1>
+
+  <label>Node Description
+    <input id="desc" placeholder="e.g. Outdoor Node #1" />
+  </label>
+
+  <div class="row">
+    <div class="col">
+      <label>SSID
+        <input id="ssid" placeholder="Wi-Fi SSID" />
+      </label>
+    </div>
+    <div class="col">
+      <label>Password
+        <input id="password" placeholder="Wi-Fi Password" type="password" />
+      </label>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col">
+      <label>Type
+        <select id="type">
+          <option value="0">Outdoor</option>
+          <option value="1">Indoor</option>
+        </select>
+      </label>
+    </div>
+    <div class="col">
+      <label>GPS (optional)</label>
+      <input id="gps" placeholder="Lat,Lng (auto filled if allowed)" />
+      <div class="small">Click <em>Capture GPS</em> to fill coordinates from your device.</div>
+    </div>
+  </div>
+
+  <div style="margin-top:14px;">
+    <button id="connectBtn" class="primary">Connect to Node (BLE)</button>
+    <button id="captureGpsBtn" class="secondary" style="margin-left:0px;">Capture GPS</button>
+    <button id="disconnectBtn" class="secondary" style="margin-left:0px;" disabled>Disconnect</button>
+  </div>
+
+  <div id="status">Status logs will appear here...</div>
+
+  <div style="margin-top:12px;">
+    <div id="progressBar"><div id="progressFill"></div></div>
+    <div id="progText" class="small">OTA progress: 0%</div>
+  </div>
+
+<script>
+const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const SSID_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+const PASS_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a9";
+const STATUS_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26aa";
+const DESC_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26ab";
+const TYPE_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26ac";
+const GPS_CHAR_UUID  = "beb5483e-36e1-4688-b7f5-ea07361b26ad";
+const PROG_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26ae";
+const MAC_CHAR_UUID  = "beb5483e-36e1-4688-b7f5-ea07361b26af";
+
+let device, server, service;
+let chars = {};
+let isConnected = false;
+let nodeMac = "";
+
+function log(msg, type = 'info') {
+  const el = document.getElementById("status");
+  const timestamp = new Date().toLocaleTimeString();
+  let prefix = {info:"ℹ️ ", error:"❌ ", success:"✅ ", warning:"⚠️ "}[type] || "";
+  el.innerText += `\n[${timestamp}] ${prefix}${msg}`;
+  el.scrollTop = el.scrollHeight;
+  console.log(`[${type.toUpperCase()}] ${msg}`);
+}
+
+function setProgress(percent) {
+  const fill = document.getElementById("progressFill");
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+  fill.style.width = percent + "%";
+  document.getElementById("progText").innerText = "OTA progress: " + percent + "%";
+}
+
+function updateUIState() {
+  document.getElementById("connectBtn").disabled = isConnected;
+  document.getElementById("disconnectBtn").disabled = !isConnected;
+}
+
+function downloadTicket(info) {
+  const blob = new Blob([info], { type: "text/plain" });
+  const cleanMac = (nodeMac || "Node").replace(/[^A-F0-9]/ig, "");
+  const fname = `DeploymentTicket_${cleanMac || "Node"}.txt`;
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = fname;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+document.getElementById("captureGpsBtn").addEventListener("click", () => {
+  if (!navigator.geolocation) {
+    log("Geolocation not supported by this browser", 'error');
+    return;
+  }
+
+  log("Requesting GPS location...", 'info');
+
+  navigator.geolocation.getCurrentPosition(
+    pos => {
+      const s = pos.coords.latitude.toFixed(6) + "," + pos.coords.longitude.toFixed(6);
+      document.getElementById("gps").value = s;
+      log(`GPS captured: ${s}`, 'success');
+    },
+    err => {
+      let errorMsg = "GPS error: ";
+      switch(err.code) {
+        case err.PERMISSION_DENIED:
+          errorMsg += "Permission denied";
+          break;
+        case err.POSITION_UNAVAILABLE:
+          errorMsg += "Position unavailable";
+          break;
+        case err.TIMEOUT:
+          errorMsg += "Request timeout";
+          break;
+        default:
+          errorMsg += err.message;
+      }
+      log(errorMsg, 'error');
+    },
+    {
+      timeout: 15000,
+      enableHighAccuracy: true
+    }
+  );
+});
+
+async function tryStartNotifications(characteristic, label) {
+  // Attempt startNotifications; some BLE stacks need time - try once, catch and log
+  try {
+    await characteristic.startNotifications();
+    characteristic.addEventListener('characteristicvaluechanged', (ev) => {
+      const raw = ev.target.value;
+      const msg = new TextDecoder().decode(raw.buffer);
+      if (label === 'status') {
+        log(`[ESP32] ${msg}`, 'info');
+        // parse WiFi OK / FAIL messages
+        if (msg.startsWith("WiFi OK")) {
+          const parts = msg.split(':');
+          const ip = parts.length > 1 ? parts.slice(1).join(':') : '';
+          log(`✅ Node connected to WiFi: ${ip}`, 'success');
+        } else if (msg.startsWith("WiFi FAIL")) {
+          log("❌ Node failed to connect to WiFi.", 'error');
+        }
+      } else if (label === 'prog') {
+        const progress = parseInt(msg) || 0;
+        setProgress(progress);
+        log(`[PROGRESS] ${progress}%`, 'info');
+        if (progress >= 100) {
+          log("OTA reached 100% — generating deployment ticket...", 'success');
+          const desc = document.getElementById("desc").value.trim();
+          const type = document.getElementById("type").value;
+          const ssid = document.getElementById("ssid").value.trim();
+          const gps = document.getElementById("gps").value.trim();
+          const ticket =
+`SACAQM Node Deployment Ticket
+=============================
+Description: ${desc}
+Type: ${type === "0" ? "Outdoor" : "Indoor"}
+Wi-Fi SSID: ${ssid}
+GPS: ${gps || "N/A"}
+MAC: ${nodeMac || "N/A"}
+Timestamp: ${new Date().toLocaleString()}
+`;
+          downloadTicket(ticket);
+        }
+      }
+    });
+    log(`Subscribed to ${label.toUpperCase()} notifications`, 'success');
+  } catch (e) {
+    log(`Failed to start ${label.toUpperCase()} notifications: ${e.message}`, 'warning');
+  }
+}
+
+document.getElementById("connectBtn").addEventListener("click", async () => {
+  const desc = document.getElementById("desc").value.trim();
+  const ssid = document.getElementById("ssid").value.trim();
+  const pass = document.getElementById("password").value;
+  const type = document.getElementById("type").value;
+  const gps = document.getElementById("gps").value.trim();
+
+  // Validation
+  if (!ssid || !pass || !desc) {
+    log("Please fill Description, SSID, and Password fields.", 'error');
+    return;
+  }
+
+  try {
+    log("Requesting BLE device...", 'info');
+
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: "ESP32-Provision" }],
+      optionalServices: [SERVICE_UUID]
+    });
+
+    device.addEventListener('gattserverdisconnected', () => {
+      log("Device disconnected", 'warning');
+      isConnected = false;
+      updateUIState();
+    });
+
+    log("Connecting to GATT server...", 'info');
+    server = await device.gatt.connect();
+    isConnected = true;
+    updateUIState();
+
+    log("Getting service...", 'info');
+    service = await server.getPrimaryService(SERVICE_UUID);
+    log("Service connected successfully", 'success');
+
+    // Discover characteristics
+    const charUuids = {
+      ssid: SSID_CHAR_UUID, pass: PASS_CHAR_UUID, desc: DESC_CHAR_UUID,
+      type: TYPE_CHAR_UUID, gps: GPS_CHAR_UUID, status: STATUS_CHAR_UUID,
+      prog: PROG_CHAR_UUID, mac: MAC_CHAR_UUID
+    };
+
+    for (const [k, uuid] of Object.entries(charUuids)) {
+      try {
+        chars[k] = await service.getCharacteristic(uuid);
+        log(`Found ${k} characteristic`, 'success');
+      } catch (errChar) {
+        chars[k] = null;
+        log(`Characteristic ${k} not found: ${errChar.message}`, 'warning');
+      }
+    }
+
+    // Read MAC if present
+    if (chars.mac) {
+      try {
+        const val = await chars.mac.readValue();
+        nodeMac = new TextDecoder().decode(val.buffer);
+        log(`Node MAC: ${nodeMac}`, 'info');
+      } catch (err) {
+        log("Failed to read MAC characteristic: " + err.message, 'warning');
+      }
+    } else {
+      log("MAC characteristic not available", 'warning');
+    }
+
+    // --- subscribe to notifications BEFORE writing provisioning data ---
+    if (chars.status) {
+      await tryStartNotifications(chars.status, 'status');
+    } else {
+      log("STATUS characteristic not available", 'warning');
+    }
+
+    if (chars.prog) {
+      await tryStartNotifications(chars.prog, 'prog');
+    } else {
+      log("PROG characteristic not available", 'warning');
+    }
+
+    // --- now write provisioning data ---
+    log("Sending provisioning data...", 'info');
+
+    try {
+      if (chars.desc) {
+        await chars.desc.writeValue(new TextEncoder().encode(desc));
+        log("Description written", 'success');
+      }
+      if (chars.type) {
+        await chars.type.writeValue(new TextEncoder().encode(type));
+        log("Type written", 'success');
+      }
+      if (gps && chars.gps) {
+        await chars.gps.writeValue(new TextEncoder().encode(gps));
+        log("GPS written", 'success');
+      }
+      if (chars.ssid) {
+        await chars.ssid.writeValue(new TextEncoder().encode(ssid));
+        log("SSID written", 'success');
+      }
+      if (chars.pass) {
+        await chars.pass.writeValue(new TextEncoder().encode(pass));
+        log("Password written", 'success');
+      }
+
+      log("All provisioning data sent successfully!", 'success');
+      log("Node will now attempt WiFi connection and OTA update. Monitor progress and status above.", 'info');
+
+    } catch (writeErr) {
+      log("Write error: " + writeErr.message, 'error');
+    }
+
+  } catch (err) {
+    log(`Connection error: ${err.message}`, 'error');
+    isConnected = false;
+    updateUIState();
+  }
+});
+
+document.getElementById("disconnectBtn").addEventListener("click", async () => {
+  if (device && device.gatt.connected) {
+    try {
+      log("Disconnecting from device...", 'info');
+      device.gatt.disconnect();
+      isConnected = false;
+      updateUIState();
+      log("Disconnected successfully", 'success');
+    } catch (err) {
+      log(`Disconnect error: ${err.message}`, 'error');
+    }
+  }
+});
+
+// Initialize UI state
+updateUIState();
+log("Web app initialized. Fill in the form and click 'Connect to Node' to begin.", 'info');
+</script>
+</body>
+</html>
